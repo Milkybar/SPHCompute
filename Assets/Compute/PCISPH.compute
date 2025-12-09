@@ -1,0 +1,305 @@
+#pragma kernel CSMain_ApplyExternalForces
+#pragma kernel CSMain_Integrate
+#pragma kernel CSMain_PressureStep
+#pragma kernel CSMain_Project
+#pragma kernel CSMain_Correct
+#pragma kernel CSMain_EnforceBoundary
+#pragma kernel CSMain_GridReset
+#pragma kernel CSMain_GridCount
+//#pragma kernel CSMain_GridMaintain;
+
+
+static const float PI = 3.14159265;
+static const int solverSteps = 10; // can modify values to run at half the fps, nice double performance win
+static const int fps = 60;// / 2;
+static const float eps = 0.00001;
+static const float eps2 = eps * eps;
+static const float restDensity = 35.0;
+static const float stiffness = 0.08;// / 2.0f;
+static const float stiffApprox = 0.1;// / 2.0f;
+static const float surfaceTension = 0.0001;// * 2.0f;
+static const float linearVisc = 0.25;// * 2.0f;
+static const float quadVisc = 0.5;// * 2.0f * 2.0f;
+static const float particleRadius = 0.03;
+static const float h = 6.0 * particleRadius;
+static const float h2 = h * h;
+static const float dt = (1.0 / fps) / solverSteps;
+static const float dt2 = dt * dt;
+static const float kern = 20.0 / (2.0 * PI * h2);
+static const float kernNorm = 30.0f / (2.0 * PI * h2);
+static const float2 gravityDt = float2(0, -9.81) * dt;
+static const float particleMass = 1.0;
+
+static const float width = 52;
+static const float height = 30;
+
+static const float c_GridCellSize = 0.2f;
+static const int c_MaxCellParticles = 32;
+
+
+struct Particle
+{
+	float2 m_Position;
+	float2 m_PositionProj;
+	float2 m_PositionLast;
+	float2 m_Velocity;
+	float m_Pressure;
+	float m_PressureV;
+};
+
+
+RWStructuredBuffer<Particle> Particles;
+uint ParticleCount;
+RWByteAddressBuffer GridCount;
+uint GridX;
+uint GridY;
+RWStructuredBuffer<uint> GridLookup;
+
+//RWStructuredBuffer<int> GridCount2;
+//RWStructuredBuffer<uint> GridLookup2;
+
+float Time;
+
+
+uint2 CellIndex(float2 position)
+{
+	return floor(position / c_GridCellSize); // think this shoudl be floor not ceil
+}
+
+
+
+[numthreads(64, 1, 1)]
+void CSMain_ApplyExternalForces(uint3 id : SV_DispatchThreadID)
+{
+	if ((id.x < ParticleCount) == false) return;
+
+	Particles[id.x].m_Velocity += gravityDt;
+}
+
+[numthreads(64, 1, 1)]
+void CSMain_Integrate(uint3 id : SV_DispatchThreadID)
+{
+	if ((id.x < ParticleCount) == false) return;
+
+	Particles[id.x].m_PositionLast = Particles[id.x].m_Position;
+	Particles[id.x].m_Position += Particles[id.x].m_Velocity * dt;
+}
+
+[numthreads(64, 1, 1)]
+void CSMain_PressureStep(uint3 id : SV_DispatchThreadID)
+{
+	if ((id.x < ParticleCount) == false) return;
+
+	float2 pix = Particles[id.x].m_Position;
+
+	float dens = 0.0;
+	float densProj = 0.0;
+
+	// todo(luke) : implement faster neighbour lookup
+	int2 cellIndex = (int2)CellIndex(pix);
+	uint2 _min = max(cellIndex - int2(1, 1), int2(0, 0)); // todo(luke) : we are not passing in these values
+	uint2 _max = min(cellIndex + int2(2, 2), int2(GridX, GridY)); // if the grid size changes things will break
+
+	for (uint y = _min.y; y < _max.y; ++y)
+	{
+		for (uint x = _min.x; x < _max.x; ++x)
+		{
+			uint cell_index = x + y * GridX;
+			uint p_index = cell_index * c_MaxCellParticles;
+			uint p_count = p_index + GridCount.Load(cell_index * 4);
+
+			for (uint j = p_index; j < p_count; ++j)
+			{
+				uint index_j = GridLookup[j];
+				float2 dx = Particles[index_j].m_Position - pix;
+				float r2 = dot(dx, dx);
+				if (r2 < eps2 || r2 > h2) continue;
+
+				float r = sqrt(r2);
+				float a = 1.0 - r / h;
+				dens += particleMass * a * a * a * kern;
+				densProj += particleMass * a * a * a * a * kernNorm;
+			}
+		}
+	}
+
+	// test(luke) : increase density based on proximity to lower boundary
+	{
+		float r = pix.y;
+		if (r < h)
+		{
+			float a = 2.0 - r / h;
+			dens *= a;
+			densProj *= a;
+		}
+	}
+
+	Particles[id.x].m_Pressure = stiffness * (dens - particleMass * restDensity);
+	Particles[id.x].m_PressureV = stiffApprox * densProj;
+}
+
+[numthreads(64, 1, 1)]
+void CSMain_Project(uint3 id : SV_DispatchThreadID)
+{
+	if ((id.x < ParticleCount) == false) return;
+
+	Particle pi = Particles[id.x];
+	float2 xx = pi.m_Position;
+
+	// todo(luke) : implement faster neighbour lookup
+	int2 cellIndex = (int2)CellIndex(xx);
+	uint2 _min = max(cellIndex - int2(1, 1), int2(0, 0)); // todo(luke) : we are not passing in these values
+	uint2 _max = min(cellIndex + int2(2, 2), int2(GridX, GridY)); // if the grid size changes things will break
+
+	for (uint y = _min.y; y < _max.y; ++y)
+	{
+		for (uint x = _min.x; x < _max.x; ++x)
+		{
+			uint cell_index = x + y * GridX;
+			uint p_index = cell_index * c_MaxCellParticles;
+			uint p_count = p_index + GridCount.Load(cell_index * 4);
+
+			for (uint j = p_index; j < p_count; ++j)
+			{
+				uint index_j = GridLookup[j];
+				Particle pj = Particles[index_j];
+
+				float2 dx = pj.m_Position - pi.m_Position;
+				float r2 = dot(dx, dx);
+				if (r2 < eps2 || r2 > h2) continue;
+
+				float r = sqrt(r2);
+				float a = 1.0 - r / h;
+				float d = dt2 * ((pi.m_PressureV + pj.m_PressureV) * a * a * a * kernNorm + (pi.m_Pressure + pj.m_Pressure) * a * a * kern) / 2.0f;
+
+				// relaxation
+				xx -= d * dx / (r * particleMass);
+
+				// surface tension
+				xx += (surfaceTension / particleMass) * particleMass * a * a * kern * dx;
+				// todo(luke) : only do this if materils are of same type
+				// not sure we need the divide and multiply by pass if both particles have the same mass
+
+				// viscosity
+				float2 dv = pi.m_Velocity - pj.m_Velocity;
+				float u = dot(dv, dx);
+				if (u > 0)
+				{
+					u /= r;
+					float I = 0.5f * dt * a * (linearVisc * u + quadVisc * u * u);
+					xx -= I * dx * dt;
+				}
+			}
+		}
+	}
+
+	Particles[id.x].m_PositionProj = xx;
+}
+
+[numthreads(64, 1, 1)]
+void CSMain_Correct(uint3 id : SV_DispatchThreadID)
+{
+	if ((id.x < ParticleCount) == false) return;
+
+	Particles[id.x].m_Position = Particles[id.x].m_PositionProj;
+	Particles[id.x].m_Velocity = (Particles[id.x].m_Position - Particles[id.x].m_PositionLast) / dt;
+}
+
+[numthreads(64, 1, 1)]
+void CSMain_EnforceBoundary(uint3 id : SV_DispatchThreadID)
+{
+	if ((id.x < ParticleCount) == false) return;
+
+	Particle pi = Particles[id.x];
+
+	float min_x = 0; // (1.0 - abs(sin(Time))) * 5.0;
+	if (pi.m_Position.x < min_x)
+	{
+		pi.m_Position.x = min_x + eps;
+		pi.m_Velocity.x *= -0.5;
+	}
+
+	if (pi.m_Position.y < 0)
+	{
+		pi.m_Position.y = 0 + eps;
+		pi.m_Velocity.y *= -0.5;
+	}
+
+	if (pi.m_Position.x > width)
+	{
+		pi.m_Position.x = width - eps;
+		pi.m_Velocity.x *= -0.5;
+	}
+
+	if (pi.m_Position.y > height)
+	{
+		pi.m_Position.y = height - eps;
+		pi.m_Velocity.y *= -0.5;
+	}
+
+	Particles[id.x] = pi;
+}
+
+[numthreads(8, 8, 1)]
+void CSMain_GridReset(uint3 id : SV_DispatchThreadID)
+{
+	if ((id.x < ParticleCount) == false) return;
+
+	uint cellIndex = id.x + id.y * GridX;
+	GridCount.Store(cellIndex * 4u, 0u);
+}
+
+[numthreads(64, 1, 1)]
+void CSMain_GridCount(uint3 id : SV_DispatchThreadID)
+{
+	if ((id.x < ParticleCount) == false) return;
+
+	Particle pi = Particles[id.x];
+	uint2 cellIndex2 = CellIndex(pi.m_Position);
+	uint cellIndex = cellIndex2.x + cellIndex2.y * GridX;
+
+	uint original = 0u;
+	GridCount.InterlockedAdd(cellIndex * 4u, 1u, original);
+	GridLookup[cellIndex * c_MaxCellParticles + original] = id.x;
+}
+
+/*
+[numthreads(8, 8, 1)]
+void CSMain_GridMaintain(uint3 id : SV_DispatchThreadID)
+{
+	uint cellIndex = id.x + id.y * GridX;
+	uint lookupIndex = cellIndex * c_MaxCellParticles;
+	int count = 0;
+
+	uint2 _min = max(((int2)id.xy) - int2(1, 1), int2(0, 0)); // todo(luke) : we are not passing in these values
+	uint2 _max = min(((int2)id.xy) + int2(2, 2), int2(GridX, GridY)); // if the grid size changes things will break
+
+	for (uint y = _min.y; y < _max.y; ++y)
+	{
+		for (uint x = _min.x; x < _max.x; ++x)
+		{
+			uint cell_index = x + y * GridX;
+			uint p_index = cell_index * c_MaxCellParticles;
+			uint p_count = p_index + GridCount[cell_index];
+
+			for (uint j = p_index; j < p_count; ++j)
+			{
+				uint index_j = GridLookup[j];
+				Particle pj = Particles[index_j];
+
+				uint2 p_cell_index2 = CellIndex(pj.m_Position);
+				//uint p_cell_index = p_cell_index2.x + p_cell_index2.y * GridX;
+
+				if (p_cell_index2.x == id.x && p_cell_index2.y == id.y)
+				{
+					GridLookup2[lookupIndex] = index_j;
+					lookupIndex++;
+					count++;
+				}
+			}
+		}
+	}
+
+	GridCount2[cellIndex] = count;
+}
+*/
